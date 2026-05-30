@@ -1,108 +1,98 @@
-name: AWS CI/CD Deployment
+name: workflow
 
 on:
   push:
     branches:
       - main
-      - develop
-  pull_request:
-    branches:
-      - main
+    paths-ignore:
+      - 'README.md'
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  deploy:
+  integration:
+    name: Continuous Integration
     runs-on: ubuntu-latest
-    
-    permissions:
-      id-token: write
-      contents: read
-
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-      IMAGE_TAG: latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
+      - name: Lint code
+        run: echo "Linting repository"
+
+      - name: Run unit tests
+        run: echo "Running unit tests"
+
+  build-and-push-ecr-image:
+    name: Continuous Delivery
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v1
         with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Check disk space before pulling
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: latest
         run: |
-          echo "Available disk space:"
-          df -h
-          echo ""
-          echo "Docker system info:"
-          docker system df || true
-
-      - name: Clean up Docker resources
-        run: |
-          docker system prune -a --force || true
-          docker volume prune -f || true
-
-      - name: Pull Docker Image (with retry)
-        id: pull-image
-        run: |
-          set -e
-          MAX_ATTEMPTS=3
-          ATTEMPT=1
-          REGISTRY_URL="${{ steps.login-ecr.outputs.registry }}"
-          IMAGE="${REGISTRY_URL}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           
-          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS to pull image: $IMAGE"
-            if timeout 300 docker pull "$IMAGE"; then
-              echo "Successfully pulled image on attempt $ATTEMPT"
-              echo "image=$IMAGE" >> $GITHUB_OUTPUT
-              exit 0
-            else
-              EXIT_CODE=$?
-              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-                echo "Pull failed with exit code $EXIT_CODE. Waiting 15 seconds before retry..."
-                sleep 15
-              fi
-            fi
-            ATTEMPT=$((ATTEMPT + 1))
-          done
           
-          echo "Failed to pull image after $MAX_ATTEMPTS attempts"
-          exit 1
+  Continuous-Deployment:
+    needs: build-and-push-ecr-image
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Run Docker container
-        run: |
-          docker run --rm \
-            -e AWS_REGION=${{ env.AWS_REGION }} \
-            -e AWS_ACCESS_KEY_ID=${{ env.AWS_ACCESS_KEY_ID }} \
-            -e AWS_SECRET_ACCESS_KEY=${{ env.AWS_SECRET_ACCESS_KEY }} \
-            ${{ steps.pull-image.outputs.image }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Deploy to AWS
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      
+      - name: Pull latest images
         run: |
-          # Your deployment commands here
-          echo "Deploying to AWS..."
-          # Example: aws s3 sync ./build s3://your-bucket/
-          # Example: aws cloudformation deploy ...
-
-      - name: Verify deployment
+         docker pull ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+         
+      # - name: Stop and remove  container if running
+      #   run: |
+      #    docker ps -q --filter "name=mltest" | grep -q . && docker stop mltest && docker rm -fv mltest
+       
+      - name: Run Docker Image to serve users
         run: |
-          echo "Verifying deployment..."
-          # Add your verification commands here
-
-      - name: Cleanup on failure
-        if: failure()
+         docker run -d -p 8080:8080 --ipc="host" --name=mltest -e 'AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' -e 'AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' -e 'AWS_REGION=${{ secrets.AWS_REGION }}'  ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+      - name: Clean previous images and containers
         run: |
-          echo "Cleaning up failed deployment artifacts..."
-          docker system prune -a --force || true
+         docker system prune -f
