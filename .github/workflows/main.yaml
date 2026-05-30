@@ -1,113 +1,108 @@
-name: AWS CI-CD Pipeline
+name: AWS CI/CD Deployment
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - README.md
-
-permissions:
-  id-token: write
-  contents: read
+      - develop
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  integration:
-    name: Continuous Integration
+  deploy:
     runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      IMAGE_TAG: latest
 
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Lint Code
-        run: echo "Linting repository"
-
-      - name: Run Unit Tests
-        run: echo "Running unit tests"
-
-  build-and-push:
-    name: Continuous Delivery
-    needs: integration
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push Docker Image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
-          IMAGE_TAG: latest
+      - name: Check disk space before pulling
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "Available disk space:"
+          df -h
+          echo ""
+          echo "Docker system info:"
+          docker system df || true
 
-  deployment:
-    name: Continuous Deployment
-    needs: build-and-push
-    runs-on: self-hosted
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Verify Docker
+      - name: Clean up Docker resources
         run: |
-          docker --version
-          docker ps
+          docker system prune -a --force || true
+          docker volume prune -f || true
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Pull Latest Image
+      - name: Pull Docker Image (with retry)
+        id: pull-image
         run: |
-          docker pull ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+          set -e
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          REGISTRY_URL="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE="${REGISTRY_URL}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS to pull image: $IMAGE"
+            if timeout 300 docker pull "$IMAGE"; then
+              echo "Successfully pulled image on attempt $ATTEMPT"
+              echo "image=$IMAGE" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              EXIT_CODE=$?
+              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                echo "Pull failed with exit code $EXIT_CODE. Waiting 15 seconds before retry..."
+                sleep 15
+              fi
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          echo "Failed to pull image after $MAX_ATTEMPTS attempts"
+          exit 1
 
-      - name: Stop Existing Container
+      - name: Run Docker container
         run: |
-          docker stop mltest || true
-          docker rm mltest || true
+          docker run --rm \
+            -e AWS_REGION=${{ env.AWS_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ env.AWS_ACCESS_KEY_ID }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ env.AWS_SECRET_ACCESS_KEY }} \
+            ${{ steps.pull-image.outputs.image }}
 
-      - name: Run Container
+      - name: Deploy to AWS
         run: |
-          docker run -d \
-            --name mltest \
-            --restart unless-stopped \
-            -p 8080:8080 \
-            -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
-            -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
-            -e AWS_REGION="${{ secrets.AWS_REGION }}" \
-            ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+          # Your deployment commands here
+          echo "Deploying to AWS..."
+          # Example: aws s3 sync ./build s3://your-bucket/
+          # Example: aws cloudformation deploy ...
 
-      - name: Check Container Status
+      - name: Verify deployment
         run: |
-          sleep 10
-          docker ps -a
+          echo "Verifying deployment..."
+          # Add your verification commands here
 
-      - name: Show Container Logs
+      - name: Cleanup on failure
+        if: failure()
         run: |
-          docker logs mltest || true
-
-      - name: Cleanup Unused Images
-        run: |
-          docker image prune -af || true
+          echo "Cleaning up failed deployment artifacts..."
+          docker system prune -a --force || true
