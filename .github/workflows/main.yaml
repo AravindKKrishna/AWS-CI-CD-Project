@@ -77,7 +77,6 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Pull Latest Image
@@ -89,11 +88,7 @@ jobs:
           docker stop mltest || true
           docker rm mltest || true
 
-      - name: Remove Old Image Cache
-        run: |
-          docker image prune -af || true
-
-      - name: Run New Container
+      - name: Run Container
         run: |
           docker run -d \
             --name mltest \
@@ -104,8 +99,15 @@ jobs:
             -e AWS_REGION="${{ secrets.AWS_REGION }}" \
             ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
 
-      - name: Verify Container
+      - name: Check Container Status
         run: |
-          sleep 15
+          sleep 10
           docker ps -a
-          docker logs mltest
+
+      - name: Show Container Logs
+        run: |
+          docker logs mltest || true
+
+      - name: Cleanup Unused Images
+        run: |
+          docker image prune -af || true
