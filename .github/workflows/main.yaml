@@ -83,17 +83,18 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v1
 
       - name: Verify Docker is running
-        run: |
-          docker info
+        run: docker info
 
       - name: Pull latest Docker image
         run: |
           set -e
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+          docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_LOGIN_URI }}
+
           docker pull ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
 
       - name: Stop and remove existing container
-        run: |
-          docker rm -f mltest || true
+        run: docker rm -f mltest || true
 
       - name: Run Docker container
         run: |
@@ -112,5 +113,4 @@ jobs:
           docker logs mltest --tail 50 || true
 
       - name: Clean unused Docker resources
-        run: |
-          docker system prune -f
+        run: docker system prune -f
