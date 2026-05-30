@@ -57,6 +57,7 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
           IMAGE_TAG: latest
         run: |
+          set -e
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -81,8 +82,13 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
+      - name: Verify Docker is running
+        run: |
+          docker info
+
       - name: Pull latest Docker image
         run: |
+          set -e
           docker pull ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
 
       - name: Stop and remove existing container
@@ -91,6 +97,7 @@ jobs:
 
       - name: Run Docker container
         run: |
+          set -e
           docker run -d -p 8080:8080 \
             --ipc=host \
             --name mltest \
@@ -98,6 +105,11 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
             -e AWS_REGION=${{ secrets.AWS_REGION }} \
             ${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+
+      - name: Verify container is running
+        run: |
+          docker ps
+          docker logs mltest --tail 50 || true
 
       - name: Clean unused Docker resources
         run: |
